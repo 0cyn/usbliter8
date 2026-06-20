@@ -2,7 +2,10 @@
 
 #define HANDLE_USB_REQ              0x10000E3EC
 #define PLATFORM_DEMOTE             0x100007CF8
+#define FINISH_USB_TRANSFER         0xDEADBEEF
 #define PLATFORM_SET_REMOTE_BOOT    0x100006850
+#define PANIC                       0xDEADBEEF
+#define DFU_BASE                    0xDEADBEEF
 
 #define MAIN_TASK_STACK_LR  0x19C01DF08
 #define JUMP_AWAY           0x100001C8C

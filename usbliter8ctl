@@ -2,27 +2,94 @@
 
 import argparse
 from pathlib import Path
-import usb
+import struct
+import sys
+import usb.core
 
 DFU_DNLOAD    = 1
+DFU_UPLOAD    = 2
+DFU_GETSTATUS = 3
 DFU_ABORT     = 4
 CUSTOM_DEMOTE = 7
 CUSTOM_BOOT   = 8
 
+REQUEST_TO_HOST_STANDARD_DEVICE     = 0x80
+REQUEST_TO_DEVICE_CLASS_INTERFACE = 0x21
+REQUEST_TO_HOST_CLASS_INTERFACE   = 0xA1
+
+USB_REQ_GET_DESCRIPTOR = 0x06
+USB_DESC_DEVICE        = 0x01
+USB_DESC_STRING        = 0x03
+
+CONTROL_REQUEST_VALUE = 0xFFFF
+
+CONTROL_MESSAGE_MAGIC     = 0x2D2A4E5741502A2D
+CONTROL_MESSAGE_BODY_SIZE = 0x100
+CONTROL_MESSAGE_HEADER    = "<QIIQQ"
+CONTROL_MESSAGE_HEADER_SIZE = struct.calcsize(CONTROL_MESSAGE_HEADER)
+CONTROL_MESSAGE_SIZE      = CONTROL_MESSAGE_HEADER_SIZE + CONTROL_MESSAGE_BODY_SIZE
+
+CONTROL_MESSAGE_TYPE_EXECUTE = 0x45     # E
+CONTROL_MESSAGE_TYPE_EXECUTE_EL1 = 0x65 # e -- some function calls may require being in EL1 for their duration.
+CONTROL_MESSAGE_TYPE_READ    = 0x52     # R
+CONTROL_MESSAGE_TYPE_WRITE   = 0x57     # W
+CONTROL_MESSAGE_TYPE_TEST    = 0x54     # X
+
+TRANSFER_SIZE = 0x800
+
+# Used for checking whether we need to invalidate i-cache / searching for the function that does that
+ROM_BASE = 0x100000000
+ROM_SIZE = 0x30000
+DEFAULT_CACHE_SCAN_LENGTH = 0x800
+
+def parse_byte(value):
+    try:
+        byte = int(value, 16)
+    except ValueError:
+        raise argparse.ArgumentTypeError("invalid byte '%s' (expected 00-ff)" % value)
+
+    if byte < 0 or byte > 0xff:
+        raise argparse.ArgumentTypeError("byte '%s' out of range (expected 00-ff)" % value)
+
+    return byte
+
+def parse_hex_data(value):
+    value = "".join(value.split())
+
+    if value.startswith("0x") or value.startswith("0X"):
+        value = value[2:]
+
+    if len(value) % 2:
+        raise argparse.ArgumentTypeError("hex data must contain an even number of digits")
+
+    try:
+        return bytes.fromhex(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("invalid hex data")
+
 def open_device():
-    dev = usb.core.find(idProduct=0x1227)
+    dev = usb.core.find(idVendor=0x5AC, idProduct=0x1227)
 
     if not dev:
         raise RuntimeError("no device?")
 
-    srnm = dev.serial_number
-
-    if "PWND:[" not in srnm:
+    if "PWND:[" not in read_serial(dev):
         raise RuntimeError("this is not Pwned DFU device")
 
     return dev
 
-TRANSFER_SIZE = 0x800
+def read_serial(dev):
+    dev_desc = dev.ctrl_transfer(REQUEST_TO_HOST_STANDARD_DEVICE, USB_REQ_GET_DESCRIPTOR, USB_DESC_DEVICE << 8, 0, 18)
+    serial_index = dev_desc[16]
+
+    if serial_index == 0:
+        return ""
+
+    raw_len = dev.ctrl_transfer(REQUEST_TO_HOST_STANDARD_DEVICE, USB_REQ_GET_DESCRIPTOR, (USB_DESC_STRING << 8) | serial_index, 0, 2)
+    length = raw_len[0]
+    raw = dev.ctrl_transfer(REQUEST_TO_HOST_STANDARD_DEVICE, USB_REQ_GET_DESCRIPTOR, (USB_DESC_STRING << 8) | serial_index, 0, length)
+
+    return bytes(raw[2:length]).decode("utf-16le", "replace")
 
 def download(dev, buf):
     offset = 0
@@ -31,7 +98,7 @@ def download(dev, buf):
     while left:
         curr_len = min(TRANSFER_SIZE, left)
 
-        dev.ctrl_transfer(0x21, DFU_DNLOAD, 0, 0, buf[offset:offset+curr_len], 1000)
+        dev.ctrl_transfer(REQUEST_TO_DEVICE_CLASS_INTERFACE, DFU_DNLOAD, 0, 0, buf[offset:offset+curr_len])
 
         offset += curr_len
         left -= curr_len
@@ -40,7 +107,126 @@ def download(dev, buf):
 
     print()
 
-    dev.ctrl_transfer(0x21, DFU_DNLOAD, 0, 0, None, 100)
+    dev.ctrl_transfer(REQUEST_TO_DEVICE_CLASS_INTERFACE, DFU_DNLOAD, 0, 0, None)
+
+def make_control_message(message_type, arg=0, body=b"", length=None):
+    if length is None:
+        length = len(body)
+
+    if len(body) > CONTROL_MESSAGE_BODY_SIZE:
+        raise ValueError("message body is too large")
+
+    if length > CONTROL_MESSAGE_BODY_SIZE:
+        raise ValueError("message length is too large")
+
+    message = bytearray(CONTROL_MESSAGE_SIZE)
+    struct.pack_into(CONTROL_MESSAGE_HEADER, message, 0, CONTROL_MESSAGE_MAGIC, message_type, 0, arg, length)
+    message[CONTROL_MESSAGE_HEADER_SIZE:CONTROL_MESSAGE_HEADER_SIZE + len(body)] = body
+    return message
+
+def parse_control_message(raw):
+    raw = bytes(raw)
+
+    if len(raw) < CONTROL_MESSAGE_SIZE:
+        raise RuntimeError("short protocol response: got 0x%x bytes" % len(raw))
+
+    magic, message_type, _reserved, arg, length = struct.unpack_from(CONTROL_MESSAGE_HEADER, raw, 0)
+
+    if magic != CONTROL_MESSAGE_MAGIC:
+        raise RuntimeError("bad protocol magic: 0x%016x" % magic)
+
+    return {
+        "type": message_type,
+        "arg": arg,
+        "length": length,
+        "body": raw[CONTROL_MESSAGE_HEADER_SIZE:CONTROL_MESSAGE_HEADER_SIZE + CONTROL_MESSAGE_BODY_SIZE],
+    }
+
+def control_transfer(dev, message_type, arg=0, body=b"", length=None):
+    message = make_control_message(message_type, arg, body, length)
+
+    dev.ctrl_transfer(REQUEST_TO_DEVICE_CLASS_INTERFACE, DFU_DNLOAD, 0, 0, b"\0" * 16)
+    dev.ctrl_transfer(REQUEST_TO_DEVICE_CLASS_INTERFACE, DFU_DNLOAD, 0, 0, None)
+    dev.ctrl_transfer(REQUEST_TO_HOST_CLASS_INTERFACE, DFU_GETSTATUS, 0, 0, 6)
+    dev.ctrl_transfer(REQUEST_TO_HOST_CLASS_INTERFACE, DFU_GETSTATUS, 0, 0, 6)
+    dev.ctrl_transfer(REQUEST_TO_DEVICE_CLASS_INTERFACE, DFU_DNLOAD, 0, 0, message)
+
+    raw = dev.ctrl_transfer(REQUEST_TO_HOST_CLASS_INTERFACE, DFU_UPLOAD, CONTROL_REQUEST_VALUE, 0, CONTROL_MESSAGE_SIZE)
+    return parse_control_message(raw)
+
+def read_memory(dev, address, length):
+    data = bytearray()
+
+    while len(data) < length:
+        chunk_size = min(CONTROL_MESSAGE_BODY_SIZE, length - len(data))
+        response = control_transfer(dev, CONTROL_MESSAGE_TYPE_READ, address + len(data), length=chunk_size)
+        data += response["body"][:chunk_size]
+
+    return bytes(data)
+
+def write_memory(dev, address, data):
+    offset = 0
+
+    while offset < len(data):
+        chunk = data[offset:offset + CONTROL_MESSAGE_BODY_SIZE]
+        control_transfer(dev, CONTROL_MESSAGE_TYPE_WRITE, address + offset, chunk)
+        offset += len(chunk)
+
+def is_rom_range(address, length):
+    return address >= ROM_BASE and length <= ROM_SIZE and address - ROM_BASE <= ROM_SIZE - length
+
+def hexdump(data, base=0):
+    for offset in range(0, len(data), 16):
+        chunk = data[offset:offset + 16]
+        hex_bytes = " ".join("%02x" % b for b in chunk)
+        ascii_bytes = "".join(chr(b) if 32 <= b <= 126 else "." for b in chunk)
+        print("%016x  %-47s  |%s|" % (base + offset, hex_bytes, ascii_bytes))
+
+def iter_arm64_words(data, base):
+    usable_len = len(data) & ~3
+
+    for offset in range(0, usable_len, 4):
+        word = struct.unpack_from("<I", data, offset)[0]
+        yield base + offset, word
+
+def find_icache_helper(data, base):
+    words = list(iter_arm64_words(data, base))
+
+    for idx in range(0, len(words) - 3):
+        sequence = [word for _addr, word in words[idx:idx + 4]]
+
+        if sequence == [0xd508751f, 0xd5033f9f, 0xd5033fdf, 0xd65f03c0]:
+            return words[idx][0]
+
+    return None
+
+def find_icache_helper_in_memory(dev, base=ROM_BASE, length=DEFAULT_CACHE_SCAN_LENGTH):
+    data = read_memory(dev, base, length)
+    return find_icache_helper(data, base)
+
+def resolve_icache_helper(dev, helper, scan_base, scan_length):
+    if helper is not None:
+        return helper
+
+    helper = find_icache_helper_in_memory(dev, scan_base, scan_length)
+
+    if helper is None:
+        raise RuntimeError("could not find callable icache helper in scan range")
+
+    return helper
+
+def invalidate_icache_with_helper(dev, helper):
+    execute_function(dev, helper, [], privileged=True)
+    print("called icache helper 0x%016x" % helper)
+
+def write_memory_with_icache(dev, address, data, helper=None, scan_base=ROM_BASE, scan_length=DEFAULT_CACHE_SCAN_LENGTH, icache=True):
+    write_memory(dev, address, data)
+
+    if icache and is_rom_range(address, len(data)):
+        helper = resolve_icache_helper(dev, helper, scan_base, scan_length)
+        invalidate_icache_with_helper(dev, helper)
+
+    return helper
 
 def do_boot(args):
     with open(args.iboot, "rb") as f:
@@ -50,12 +236,114 @@ def do_boot(args):
 
     download(dev, iboot)
 
-    dev.ctrl_transfer(0x21, CUSTOM_BOOT, 0, 0, None, 100)
-    dev.ctrl_transfer(0x21, DFU_ABORT, 0, 0, None, 100)
+    dev.ctrl_transfer(REQUEST_TO_DEVICE_CLASS_INTERFACE, CUSTOM_BOOT, 0, 0, None)
+    dev.ctrl_transfer(REQUEST_TO_DEVICE_CLASS_INTERFACE, DFU_ABORT, 0, 0, None)
 
 def do_demote(args):
     dev = open_device()
-    dev.ctrl_transfer(0x21, CUSTOM_DEMOTE, 0, 0, None, 100)
+    dev.ctrl_transfer(REQUEST_TO_DEVICE_CLASS_INTERFACE, CUSTOM_DEMOTE, 0, 0, None)
+
+def do_test(args):
+    dev = open_device()
+
+    try:
+        response = control_transfer(dev, CONTROL_MESSAGE_TYPE_TEST, body=b"\0" * 8)
+    except usb.core.USBError:
+        try:
+            print("serial after test error: %s" % read_serial(dev), file=sys.stderr)
+        except usb.core.USBError as serial_error:
+            print("serial after test error unavailable: %s" % serial_error, file=sys.stderr)
+        raise
+
+    value = struct.unpack_from("<Q", response["body"], 0)[0]
+
+    if value != 1:
+        raise RuntimeError("protocol test failed: got 0x%x" % value)
+
+    print("protocol OK")
+
+def do_read(args):
+    dev = open_device()
+    data = read_memory(dev, args.address, args.length)
+
+    if args.output:
+        args.output.write_bytes(data)
+        print("read 0x%x bytes to %s" % (len(data), args.output))
+    else:
+        hexdump(data, args.address)
+
+def do_write(args):
+    if args.input_file:
+        if args.data:
+            raise ValueError("write accepts either raw bytes or --file, not both")
+        data = args.input_file.read_bytes()
+    else:
+        if not args.data:
+            raise ValueError("write requires raw bytes or --file")
+        data = bytes(args.data)
+
+    dev = open_device()
+    write_memory_with_icache(dev, args.address, data, args.icache_helper, args.scan_base, args.scan_length, args.icache)
+    print("wrote 0x%x bytes" % len(data))
+
+def execute_function(dev, address, regs, suffix=b"", privileged=False):
+    if len(regs) > 8:
+        raise RuntimeError("execute accepts at most 8 arguments")
+
+    regs = list(regs) + [0] * (8 - len(regs))
+    body = struct.pack("<8Q", *regs) + suffix
+    message_type = CONTROL_MESSAGE_TYPE_EXECUTE_EL1 if privileged else CONTROL_MESSAGE_TYPE_EXECUTE
+    response = control_transfer(dev, message_type, address, body)
+    return struct.unpack_from("<8Q", response["body"], 0), response["body"]
+
+def do_exec(args):
+    dev = open_device()
+    result, _body = execute_function(dev, args.address, args.args)
+
+    for idx, value in enumerate(result):
+        print("x%d = 0x%016x" % (idx, value))
+
+def do_decrypt(args):
+    # This is an exec payload for the usb handler that we toss extra bytes at the end of
+    # for the aes_decrypt rom function to read
+    data = args.kbag
+    length = len(data)
+
+    if length == 0:
+        raise ValueError("KBAG hex data cannot be empty")
+
+    if length % 16 != 0:
+        raise ValueError("KBAG length must be a multiple of 0x10 bytes")
+
+    body_address = args.dfu_base + CONTROL_MESSAGE_HEADER_SIZE
+    output_address = (body_address + struct.calcsize("<8Q") + 15) & ~15
+    input_address = (output_address + length + 15) & ~15
+    output_offset = output_address - body_address
+    input_offset = input_address - body_address
+    body_length = input_offset + length
+
+    if body_length > CONTROL_MESSAGE_BODY_SIZE:
+        raise ValueError("KBAG length exceeds inline limit")
+
+    suffix = bytearray(body_length - struct.calcsize("<8Q"))
+    suffix[input_offset - struct.calcsize("<8Q"):input_offset - struct.calcsize("<8Q") + length] = data
+
+    dev = open_device()
+    result, body = execute_function(dev, args.aes_address, [
+        0x11,
+        input_address,
+        output_address,
+        length,
+        args.key,
+        0,
+        0,
+    ], bytes(suffix))
+
+    if result[0] & 0xffffffff:
+        raise RuntimeError("AES decrypt failed: x0 = 0x%016x" % result[0])
+
+    plaintext = body[output_offset:output_offset + length]
+    print(plaintext.hex())
 
 def main():
     parser = argparse.ArgumentParser(description="Love is Control")
@@ -69,12 +357,48 @@ def main():
     demote_parser = subparsers.add_parser("demote", help="demote production mode")
     demote_parser.set_defaults(func=do_demote)
 
+    serial_parser = subparsers.add_parser("serial", help="read raw DFU serial")
+    serial_parser.set_defaults(func=lambda args: print(read_serial(open_device())))
+
+    read_parser = subparsers.add_parser("read", help="read memory")
+    read_parser.set_defaults(func=do_read)
+    read_parser.add_argument("address", type=lambda value: int(value, 0))
+    read_parser.add_argument("length", type=lambda value: int(value, 0))
+    read_parser.add_argument("-o", "--output", type=Path)
+
+    write_parser = subparsers.add_parser("write", help="write memory")
+    write_parser.set_defaults(func=do_write)
+    write_parser.add_argument("address", type=lambda value: int(value, 0))
+    write_parser.add_argument("data", type=parse_byte, nargs="*", metavar="byte")
+    write_parser.add_argument("-f", "--file", dest="input_file", type=Path, help="read bytes from file")
+    write_parser.add_argument("--no-icache", dest="icache", action="store_false", help="do not auto-call ROM icache helper after ROM writes")
+    write_parser.add_argument("--icache-helper", type=lambda value: int(value, 0), help="explicit icache helper address")
+    write_parser.add_argument("--scan-base", type=lambda value: int(value, 0), default=ROM_BASE, help="ROM scan base for auto icache helper discovery")
+    write_parser.add_argument("--scan-length", type=lambda value: int(value, 0), default=DEFAULT_CACHE_SCAN_LENGTH, help="ROM scan length for auto icache helper discovery")
+    write_parser.set_defaults(icache=True)
+
+    exec_parser = subparsers.add_parser("exec", help="execute function")
+    exec_parser.set_defaults(func=do_exec)
+    exec_parser.add_argument("address", type=lambda value: int(value, 0))
+    exec_parser.add_argument("args", type=lambda value: int(value, 0), nargs="*")
+
+    decrypt_parser = subparsers.add_parser("decrypt", help="decrypt bytes with AES routine")
+    decrypt_parser.set_defaults(func=do_decrypt)
+    decrypt_parser.add_argument("aes_address", type=lambda value: int(value, 0), help="AES crypto function address")
+    decrypt_parser.add_argument("dfu_base", type=lambda value: int(value, 0), help="DFU message base address")
+    decrypt_parser.add_argument("kbag", type=parse_hex_data, help="encrypted KBAG hex data")
+    decrypt_parser.add_argument("--key", type=lambda value: int(value, 0), default=0x20000200, help="AES key selector (default: 0x20000200/GID)")
+
     args = parser.parse_args()
     if not hasattr(args, "func"):
         parser.print_help()
         exit(-1)
 
-    args.func(args)
+    try:
+        args.func(args)
+    except (RuntimeError, ValueError, usb.core.USBError) as e:
+        print("error: %s" % e, file=sys.stderr)
+        exit(1)
 
 if __name__ == "__main__":
     main()

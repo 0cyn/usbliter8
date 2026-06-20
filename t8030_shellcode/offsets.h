@@ -7,6 +7,7 @@
 #define NEW_SP      0x19C01E000
 
 #define ROM_BASE    0x100000000
+#define ROM_WRITE_ALIAS    (ROM_BASE + 0x100000)
 #define ROM_NEW_PA  0x19C390000
 #define ROM_SIZE    0x30000
 

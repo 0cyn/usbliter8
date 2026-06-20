@@ -37,6 +37,10 @@ void tt_make(void) {
     for (int p = 0; p < ROM_SIZE / PAGE_SIZE; p++) {
         uint64_t *ptep = (uint64_t *)t + p;
         *ptep = l3_pte_make_exec(ROM_NEW_PA + p * PAGE_SIZE);
+
+        // also create a writable mapping so we can do writes from our USB handler.
+        ptep = (uint64_t *)t + ((ROM_WRITE_ALIAS - ROM_BASE) / PAGE_SIZE) + p;
+        *ptep = l3_pte_make_data(ROM_NEW_PA + p * PAGE_SIZE);
     }
 
     *(ttbr + l1_off(ROM_BASE)) = l3_tte_make(t);
