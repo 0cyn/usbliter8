@@ -1,5 +1,23 @@
 # usbliter8
 
+---
+## Fork Info
+
+t8030 is the only thing implemented right now, you will need offsets for the other SOCs. 
+
+adds some mediocre R/W/X primitives over DFU. 
+
+reused the protocol from Pawn which was based on the one from ipwndfu. 
+
+builds a `decrypt` command using these primitives as an example. (also present on rwx_handler branch)
+
+on main branch:  
+adds a `nand-boot` cmd that goes down the orig. nand boot path and patches iboot to go into recovery, as a fun demo. 
+
+mtn. 0cyn
+
+---
+
 Tethered bootrom exploit for Apple A12, S4/S5 & A13 SoCs (A12X/Z can theoretically be supported as well, but it's not implemented yet).
 
 ## Bug & exploit write-up
