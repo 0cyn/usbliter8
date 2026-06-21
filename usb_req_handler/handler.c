@@ -42,7 +42,7 @@ enum {
     MESSAGE_TYPE_EXECUTE_EL1 = 0x65,
     MESSAGE_TYPE_READ    = 0x52,
     MESSAGE_TYPE_WRITE   = 0x57,
-    MESSAGE_TYPE_TEST    = 0x54
+    MESSAGE_TYPE_SET_BOOT_LR = 0x54
 };
 
 struct message {
@@ -151,6 +151,27 @@ static void execute_el1(uint64_t destination, uint8_t *body) {
     return_to_el0();
 }
 
+#if defined(BOOT_LR_SETUP)
+
+static void set_boot_lr_from_request(struct message *message) {
+    uint64_t ptr = message->arg;
+
+    if (ptr == 0) {
+        *(uint64_t *)message->body = 0;
+        return;
+    }
+
+#if WITH_PAC
+    ptr = PACIB(ptr, MAIN_TASK_STACK_LR + 8);
+#endif
+
+    *(volatile uint64_t *)MAIN_TASK_STACK_LR = ptr;
+    sync_memory_writes();
+    *(uint64_t *)message->body = 1;
+}
+
+#endif
+
 int custom_handle_usb_req(struct usb_device_request *request, uint8_t **io_buffer) {
     uint8_t bmRequestType = request->bmRequestType;
     uint8_t bRequest      = request->bRequest;
@@ -167,10 +188,12 @@ int custom_handle_usb_req(struct usb_device_request *request, uint8_t **io_buffe
             }
 
             switch (message->type) {
-                case MESSAGE_TYPE_TEST: {
-                    (*(uint64_t *)message->body)++;
+#if defined(BOOT_LR_SETUP)
+                case MESSAGE_TYPE_SET_BOOT_LR: {
+                    set_boot_lr_from_request(message);
                     break;
                 }
+#endif
 
                 case MESSAGE_TYPE_READ: {
                     copy_bytes(message->body, (const uint8_t *)message->arg, length);

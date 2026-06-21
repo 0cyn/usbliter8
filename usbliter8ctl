@@ -9,7 +9,9 @@ import usb.core
 DFU_DNLOAD    = 1
 DFU_UPLOAD    = 2
 DFU_GETSTATUS = 3
-DFU_ABORT     = 4
+DFU_CLR_STATUS = 4
+DFU_GETSTATE   = 5
+DFU_ABORT      = 6
 CUSTOM_DEMOTE = 7
 CUSTOM_BOOT   = 8
 
@@ -33,7 +35,7 @@ CONTROL_MESSAGE_TYPE_EXECUTE = 0x45     # E
 CONTROL_MESSAGE_TYPE_EXECUTE_EL1 = 0x65 # e -- some function calls may require being in EL1 for their duration.
 CONTROL_MESSAGE_TYPE_READ    = 0x52     # R
 CONTROL_MESSAGE_TYPE_WRITE   = 0x57     # W
-CONTROL_MESSAGE_TYPE_TEST    = 0x54     # X
+CONTROL_MESSAGE_TYPE_SET_BOOT_LR = 0x54
 
 TRANSFER_SIZE = 0x800
 
@@ -41,6 +43,22 @@ TRANSFER_SIZE = 0x800
 ROM_BASE = 0x100000000
 ROM_SIZE = 0x30000
 DEFAULT_CACHE_SCAN_LENGTH = 0x800
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+SHELLCODE_DIR = SCRIPT_DIR / "usbliter8ctl_shellcode"
+
+ARM64_B_SELF = b"\x00\x00\x00\x14"  # b . - spin in place; for debugging w/o a debugger.
+
+T8030_MAIN_TASK_STACK_LR = 0x19C01DF08
+T8030_NAND_ENTRY = 0x100001EF4
+T8030_PANIC = 0x100008F90
+T8030_IMAGE_LOAD_TAG_COUNT_PATCH = 0x1000020C4
+T8030_POST_IMAGE_LOAD_PATCH = 0x1000021B4
+T8030_HANDOFF_PATCH = 0x1000021D0
+T8030_HANDLER_BASE = ROM_BASE + ROM_SIZE - 0x400
+T8030_NAND_BOOT_TRAMPOLINE = T8030_PANIC + 4
+T8030_NAND_BOOT_TARGET_LITERAL = T8030_PANIC + 0x60
+T8030_IBOOT_RECOVERY_STUB = T8030_HANDLER_BASE + 0x300
 
 def parse_byte(value):
     try:
@@ -175,6 +193,33 @@ def write_memory(dev, address, data):
 def is_rom_range(address, length):
     return address >= ROM_BASE and length <= ROM_SIZE and address - ROM_BASE <= ROM_SIZE - length
 
+def pack_u64(value):
+    if value < 0 or value > 0xffffffffffffffff:
+        raise ValueError("value 0x%x does not fit in u64" % value)
+
+    return struct.pack("<Q", value)
+
+def ranges_overlap(addr1, len1, addr2, len2):
+    return addr1 < addr2 + len2 and addr2 < addr1 + len1
+
+def load_shellcode(name):
+    payload = SHELLCODE_DIR / "t8030" / "payloads" / (name + ".bin")
+
+    try:
+        data = payload.read_bytes()
+    except FileNotFoundError:
+        raise RuntimeError("missing prebuilt shellcode %s; run %s" % (payload, SHELLCODE_DIR / "make.sh"))
+
+    if not data:
+        raise RuntimeError("prebuilt shellcode %s is empty" % payload)
+
+    return data
+
+def verify_memory(dev, address, expected, label):
+    actual = read_memory(dev, address, len(expected))
+    if actual != expected:
+        raise RuntimeError("%s verify failed at 0x%016x" % (label, address))
+
 def hexdump(data, base=0):
     for offset in range(0, len(data), 16):
         chunk = data[offset:offset + 16]
@@ -239,28 +284,62 @@ def do_boot(args):
     dev.ctrl_transfer(REQUEST_TO_DEVICE_CLASS_INTERFACE, CUSTOM_BOOT, 0, 0, None)
     dev.ctrl_transfer(REQUEST_TO_DEVICE_CLASS_INTERFACE, DFU_ABORT, 0, 0, None)
 
+def do_nand_boot(args):
+    trampoline = load_shellcode("nand_trampoline")
+    target_literal = pack_u64(T8030_NAND_BOOT_TRAMPOLINE)
+    tag_filter_patch = load_shellcode("image_load_tag_count_patch")
+    handoff_patch = load_shellcode("handoff_patch")
+    post_image_load_hook = load_shellcode("post_image_load_hook")
+    iboot_recovery_stub = load_shellcode("iboot_recovery_flow_stub")
+
+    rom_patches = [
+        (T8030_PANIC, ARM64_B_SELF, "panic patch"), # spin on panic because I do not have a probe.
+        (T8030_NAND_BOOT_TRAMPOLINE, trampoline, "NAND trampoline"),
+        (T8030_NAND_BOOT_TARGET_LITERAL, target_literal, "target literal"),
+        (T8030_IMAGE_LOAD_TAG_COUNT_PATCH, tag_filter_patch, "tag-count patch"),
+        (T8030_POST_IMAGE_LOAD_PATCH, post_image_load_hook, "post-image-load hook"),
+        (T8030_HANDOFF_PATCH, handoff_patch, "handoff patch"),
+        (T8030_IBOOT_RECOVERY_STUB, iboot_recovery_stub, "iBoot recovery-flow stub"),
+    ]
+
+    for address, data, label in rom_patches:
+        if not is_rom_range(address, len(data)):
+            raise ValueError("%s must be placed in ROM" % label)
+
+    if ranges_overlap(T8030_NAND_BOOT_TARGET_LITERAL, len(target_literal), T8030_NAND_BOOT_TRAMPOLINE, len(trampoline)):
+        raise ValueError("target literal overlaps NAND trampoline")
+
+    if ranges_overlap(T8030_PANIC, len(ARM64_B_SELF), T8030_NAND_BOOT_TRAMPOLINE, len(trampoline)):
+        raise ValueError("NAND trampoline overlaps the __panic spin instruction")
+
+    if ranges_overlap(T8030_PANIC, len(ARM64_B_SELF), T8030_NAND_BOOT_TARGET_LITERAL, len(target_literal)):
+        raise ValueError("target literal overlaps the __panic spin instruction")
+
+    dev = open_device()
+    helper = resolve_icache_helper(dev, None, ROM_BASE, DEFAULT_CACHE_SCAN_LENGTH)
+
+    for address, data, label in rom_patches:
+        write_memory(dev, address, data)
+        verify_memory(dev, address, data, label)
+
+    invalidate_icache_with_helper(dev, helper)
+
+    response = control_transfer(dev, CONTROL_MESSAGE_TYPE_SET_BOOT_LR, T8030_NAND_BOOT_TRAMPOLINE, body=b"\0" * 8)
+    status = struct.unpack_from("<Q", response["body"], 0)[0]
+
+    if status != 1:
+        raise RuntimeError("boot LR setup failed: status 0x%016x" % status)
+
+    try:
+        dev.ctrl_transfer(REQUEST_TO_DEVICE_CLASS_INTERFACE, DFU_ABORT, 0, 0, None)
+    except usb.core.USBError as e:
+        print("DFU_ABORT transfer ended with USB error; device may have left DFU: %s" % e)
+
+    print("sent NAND iBoot recovery boot sequence")
+
 def do_demote(args):
     dev = open_device()
     dev.ctrl_transfer(REQUEST_TO_DEVICE_CLASS_INTERFACE, CUSTOM_DEMOTE, 0, 0, None)
-
-def do_test(args):
-    dev = open_device()
-
-    try:
-        response = control_transfer(dev, CONTROL_MESSAGE_TYPE_TEST, body=b"\0" * 8)
-    except usb.core.USBError:
-        try:
-            print("serial after test error: %s" % read_serial(dev), file=sys.stderr)
-        except usb.core.USBError as serial_error:
-            print("serial after test error unavailable: %s" % serial_error, file=sys.stderr)
-        raise
-
-    value = struct.unpack_from("<Q", response["body"], 0)[0]
-
-    if value != 1:
-        raise RuntimeError("protocol test failed: got 0x%x" % value)
-
-    print("protocol OK")
 
 def do_read(args):
     dev = open_device()
@@ -353,6 +432,9 @@ def main():
     boot_parser = subparsers.add_parser("boot", help="boot raw iBoot")
     boot_parser.set_defaults(func=do_boot)
     boot_parser.add_argument("iboot", type=Path)
+
+    nand_boot_parser = subparsers.add_parser("nand-boot", help="resume ROM NAND boot and force iBoot recovery")
+    nand_boot_parser.set_defaults(func=do_nand_boot)
 
     demote_parser = subparsers.add_parser("demote", help="demote production mode")
     demote_parser.set_defaults(func=do_demote)

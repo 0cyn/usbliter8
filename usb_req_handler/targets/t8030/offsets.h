@@ -15,3 +15,5 @@
 
 #define MAIN_TASK_STACK_LR      0x19C01DF08
 #define JUMP_AWAY               0x1000021D0
+
+#define BOOT_LR_SETUP          1
